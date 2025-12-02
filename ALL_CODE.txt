@@ -145,10 +145,10 @@ while remaining > 0
         physParam, N_phys2, 'hybrid');  % 'random' | 'residual' | 'hybrid'
 
     % 在这一小段内，物理点固定，调用内部的 train 做 thisEpochs 轮更新
+    fprintf("Segment %d/%d ", (epochs2 - remaining)/chunk_stage2 + 1, epochs2/chunk_stage2);
     pinn.train(X_s2_dl, Y_s2_dl, X_phys_s2_dl, ...
                @physicsFcn_GPI_forward, physParam, lossW2, ...
                thisEpochs, lr2);
-    fprintf("Segment %d/%d ", (epochs2 - remaining)/chunk_stage2, epochs2/chunk_stage2);
 
     remaining = remaining - thisEpochs;
 end
@@ -190,10 +190,10 @@ while remaining > 0
         u_train_full, u_train_norm_row, ...
         physParam, N_phys3, 'hybrid');
 
+    fprintf("Segment %d/%d ", (epochs3 - remaining)/chunk_stage3 + 1, epochs3/chunk_stage3);
     pinn.train(X_s3_dl, Y_s3_dl, X_phys_s3_dl, ...
                @physicsFcn_GPI_forward, physParam, lossW3, ...
                thisEpochs, lr3);
-    fprintf("Segment %d/%d ", (epochs3 - remaining)/chunk_stage3, epochs3/chunk_stage3);
 
     remaining = remaining - thisEpochs;
 end
