@@ -19,7 +19,7 @@ N_train = floor(N * train_ratio);
 t_train = t(1:N_train);
 t_test  = t(N_train+1:end);
 
-% 各阶段下采样 / 物理点抽样
+% 各阶段下采样 / 物理点抽样步长（原始设定）
 data_stride_stage1 = 5;
 data_stride_stage2 = 2;
 phys_stride_stage2 = 5;
@@ -43,11 +43,24 @@ end
 
 u_train_full = u_all(1:N_train);
 v_train_full = v_all(1:N_train);
-u_test       = u_all(N_train+1:end);
-v_test       = v_all(N_train+1:end);
+u_test_full  = u_all(N_train+1:end);
+v_test_full  = v_all(N_train+1:end);
 
-X_test_dl = dlarray(single(u_test'));
-Y_test_dl = dlarray(single(v_test'));
+%% ===== 1.2 归一化 (z-score) =====
+% 注意：网络在“归一化空间”里工作：u_norm -> v_norm
+%       画图/MSE 时再反归一化回物理量
+
+% 训练集归一化
+[u_train_norm_row, normIn]  = BasePINN.normalizeData(u_train_full.', 'zscore');
+[v_train_norm_row, normOut] = BasePINN.normalizeData(v_train_full.', 'zscore');
+
+% 测试集用同一个 normInfo 做变换（保持一致）
+[u_test_norm_row, ~]  = BasePINN.normalizeData(u_test_full.',  'zscore', normIn);
+[v_test_norm_row, ~]  = BasePINN.normalizeData(v_test_full.',  'zscore', normOut);
+
+% 方便后面直接用的 dlarray 形式（归一化空间）
+X_test_dl = dlarray(single(u_test_norm_row));
+Y_test_dl = dlarray(single(v_test_norm_row));
 
 %% ===== 2. 正向迟滞参数（给 physicsFcn 用） =====
 physParam.rd  = [-8 -6 -4 -2 0 2 4 6 8];
@@ -60,6 +73,10 @@ layers = [1 64 64 1];
 dummyWeights = struct('lambdaData',1,'lambdaPhys',0,'lambdaMono',0,'lambdaSmooth',0);
 pinn = HysteresisInversePINN(layers, physParam, dummyWeights, @physicsFcn_GPI_forward);
 
+% 设置归一化参数（供 computeLoss / 其他方法内部使用）
+% 假定你在 HysteresisInversePINN 里已经实现了 setNormalization / applyDenormOut 等
+pinn.setNormalization(normIn, normOut);
+
 %% 工具：记录各阶段 lossHistory 范围
 stageRanges = struct('name',{},'idx',{});
 
@@ -67,11 +84,10 @@ stageRanges = struct('name',{},'idx',{});
 disp("===== Stage 1: Data only =====");
 
 idx_s1 = 1:data_stride_stage1:N_train;
-u_s1 = u_train_full(idx_s1);
-v_s1 = v_train_full(idx_s1);
 
-X_s1_dl = dlarray(single(u_s1'));
-Y_s1_dl = dlarray(single(v_s1'));
+% 训练数据在归一化空间：u_norm -> v_norm
+X_s1_dl = dlarray(single(u_train_norm_row(idx_s1)));
+Y_s1_dl = dlarray(single(v_train_norm_row(idx_s1)));
 
 lossW1.lambdaData   = 1;
 lossW1.lambdaPhys   = 0;
@@ -86,23 +102,27 @@ newLen = numel(pinn.lossHistory.total);
 stageRanges(end+1).name = 'Stage 1'; 
 stageRanges(end).idx    = prevLen+1:newLen;
 
-% --- Stage 1 绘图 ---
+% --- Stage 1 绘图（内部会自动做归一化/反归一化） ---
 plot_stage_fit(pinn, 1, t_train, u_train_full, v_train_full, ...
-               t_test, u_test, v_test);
+               t_test, u_test_full, v_test_full, ...
+               normIn, normOut);
 plot_stage_loss(pinn, 1, stageRanges(end).idx);
 
-%% ===== 5. Stage 2: Data + Physics，中等下采样 + 物理点抽样 =====
+%% ===== 5. Stage 2: Data + Physics，中等下采样 + 动态物理点抽样 =====
 disp("===== Stage 2: Data + Physics =====");
 
 idx_s2 = 1:data_stride_stage2:N_train;
-u_s2 = u_train_full(idx_s2);
-v_s2 = v_train_full(idx_s2);
 
-X_s2_dl = dlarray(single(u_s2'));
-Y_s2_dl = dlarray(single(v_s2'));
+X_s2_dl = dlarray(single(u_train_norm_row(idx_s2)));
+Y_s2_dl = dlarray(single(v_train_norm_row(idx_s2)));
 
-idx_phys2 = 1:phys_stride_stage2:numel(u_s2);
-X_phys_s2_dl = X_s2_dl(:, idx_phys2);
+% 原来是固定步长抽物理点，这里改成“残差+随机”的动态抽样
+% 物理点数量保持和原来大致一致：ceil(N_s2 / phys_stride_stage2)
+N_s2     = numel(idx_s2);
+N_phys2  = ceil(N_s2 / phys_stride_stage2);
+X_phys_s2_dl = samplePhysicsPoints(pinn, ...
+    u_train_full, u_train_norm_row, ...
+    physParam, N_phys2, 'hybrid');  % 'random' | 'residual' | 'hybrid'
 
 lossW2.lambdaData   = 1;
 lossW2.lambdaPhys   = 10;
@@ -119,27 +139,28 @@ stageRanges(end).idx    = prevLen+1:newLen;
 
 % --- Stage 2 绘图 ---
 plot_stage_fit(pinn, 2, t_train, u_train_full, v_train_full, ...
-               t_test, u_test, v_test);
+               t_test, u_test_full, v_test_full, ...
+               normIn, normOut);
 plot_stage_loss(pinn, 2, stageRanges(end).idx);
 
 %% ===== 6. Stage 3: Data + Physics + Mono + Smooth =====
 disp("===== Stage 3: Full loss =====");
 
 idx_s3 = idx_s2;          % 这里用和 Stage2 相同的下采样
-u_s3   = u_s2;
-v_s3   = v_s2;
 
-X_s3_dl = dlarray(single(u_s3'));   % 输入 u
-Y_s3_dl = dlarray(single(v_s3'));   % 输出 v  
+X_s3_dl = dlarray(single(u_train_norm_row(idx_s3)));   % 输入 u_norm
+Y_s3_dl = dlarray(single(v_train_norm_row(idx_s3)));   % 输出 v_norm
 
-idx_phys3     = 1:phys_stride_stage3:numel(u_s3);
-X_phys_s3_dl  = X_s3_dl(:, idx_phys3);
+N_s3     = numel(idx_s3);
+N_phys3  = ceil(N_s3 / phys_stride_stage3);
+X_phys_s3_dl = samplePhysicsPoints(pinn, ...
+    u_train_full, u_train_norm_row, ...
+    physParam, N_phys3, 'hybrid');
 
 lossW3.lambdaData   = 5;
 lossW3.lambdaPhys   = 5;
 lossW3.lambdaMono   = 0.1;
 lossW3.lambdaSmooth = 0.001;
-
 
 prevLen = numel(pinn.lossHistory.total);
 pinn.train(X_s3_dl, Y_s3_dl, X_phys_s3_dl, ...
@@ -151,21 +172,34 @@ stageRanges(end).idx    = prevLen+1:newLen;
 
 % --- Stage 3 绘图 ---
 plot_stage_fit(pinn, 3, t_train, u_train_full, v_train_full, ...
-               t_test, u_test, v_test);
+               t_test, u_test_full, v_test_full, ...
+               normIn, normOut);
 plot_stage_loss(pinn, 3, stageRanges(end).idx);
 
 %% ===== 7. 训练结束后：总拟合 + 总 loss + 滞回曲线 =====
 disp("===== Final plots =====");
 
 % ---- 总拟合：train + test ----
-v_train_pred_dl = pinn.forward(dlarray(single(u_train_full')));
-v_train_pred = double(extractdata(v_train_pred_dl)).';
+% 1) 把全量 u_train / u_test 变成归一化空间
+[u_train_norm_full_row, ~] = BasePINN.normalizeData(u_train_full.', normIn.mode, normIn);
+[u_test_norm_full_row,  ~] = BasePINN.normalizeData(u_test_full.',  normIn.mode, normIn);
 
-v_test_pred_dl = pinn.forward(X_test_dl);
-v_test_pred = double(extractdata(v_test_pred_dl)).';
+% 2) 网络前向：u_norm -> v_norm
+v_train_pred_norm_dl = pinn.forward(dlarray(single(u_train_norm_full_row)));
+v_test_pred_norm_dl  = pinn.forward(dlarray(single(u_test_norm_full_row)));
+
+v_train_pred_norm_row = double(extractdata(v_train_pred_norm_dl));
+v_test_pred_norm_row  = double(extractdata(v_test_pred_norm_dl));
+
+% 3) 反归一化到物理电压
+v_train_pred_row = BasePINN.denormalizeData(v_train_pred_norm_row, normOut);
+v_test_pred_row  = BasePINN.denormalizeData(v_test_pred_norm_row,  normOut);
+
+v_train_pred = v_train_pred_row.';   % N_train x 1
+v_test_pred  = v_test_pred_row.';    % N_test x 1
 
 mse_train = mean((v_train_pred - v_train_full).^2);
-mse_test  = mean((v_test_pred  - v_test).^2);
+mse_test  = mean((v_test_pred  - v_test_full).^2);
 
 figure('Name','Final Fit (Train + Test)');
 subplot(2,1,1); hold on; box on;
@@ -176,7 +210,7 @@ title(sprintf('Train fit (MSE=%.2e)', mse_train));
 legend('True v','PINN v_{pred}','Location','best');
 
 subplot(2,1,2); hold on; box on;
-plot(t_test, v_test, 'b', 'LineWidth',1.2);
+plot(t_test, v_test_full, 'b', 'LineWidth',1.2);
 plot(t_test, v_test_pred, 'r--','LineWidth',1.2);
 xlabel('t [s]'); ylabel('Voltage v [V]');
 title(sprintf('Test fit (MSE=%.2e)', mse_test));
@@ -206,17 +240,25 @@ if ~isempty(pinn.lossHistory.components)
 end
 
 % ---- 滞回曲线：真实 (v_all,u_all) vs PINN 逆 + 正向 GPI ----
-% 先用逆模型预测 v_pred_all，再过 physicsFcn 得到 u_hat_all
-v_pred_all_dl = pinn.forward(dlarray(single(u_all')));
-v_pred_all = double(extractdata(v_pred_all_dl)).';
+% 1) 全序列 u_all -> 归一化 u_norm_all
+[u_all_norm_row, ~] = BasePINN.normalizeData(u_all.', normIn.mode, normIn);
 
-u_hat_all_dl = physicsFcn_GPI_forward(dlarray(single(v_pred_all')), physParam);
-u_hat_all = double(extractdata(u_hat_all_dl)).';
+% 2) 逆模型：u_norm_all -> v_norm_all
+v_pred_all_norm_dl  = pinn.forward(dlarray(single(u_all_norm_row)));
+v_pred_all_norm_row = double(extractdata(v_pred_all_norm_dl));
+
+% 3) 反归一化到物理电压
+v_pred_all_row = BasePINN.denormalizeData(v_pred_all_norm_row, normOut);
+v_pred_all     = v_pred_all_row.';   % N x 1
+
+% 4) 正向 GPI：v_pred_all -> u_hat_all
+u_hat_all_dl = physicsFcn_GPI_forward(dlarray(single(v_pred_all.')), physParam);
+u_hat_all    = double(extractdata(u_hat_all_dl)).';
 
 figure('Name','Hysteresis Loop');
 hold on; box on;
-plot(v_all, u_all, 'b.', 'DisplayName','True hysteresis');
-plot(v_pred_all, u_hat_all, 'r.', 'DisplayName','PINN inverse -> forward');
+plot(v_all,       u_all,    'b.', 'DisplayName','True hysteresis');
+plot(v_pred_all,  u_hat_all,'r.', 'DisplayName','PINN inverse -> forward');
 xlabel('Voltage v'); ylabel('Displacement u');
 legend('Location','best');
 title('Hysteresis loop comparison');
@@ -224,13 +266,25 @@ grid on;
 
 %% ================== 辅助绘图函数 ==================
 function plot_stage_fit(pinn, stageId, t_train, u_train, v_train, ...
-                        t_test, u_test, v_test)
+                        t_test,  u_test,  v_test, ...
+                        normIn, normOut)
+    % 1) 物理 u -> 归一化 u_norm
+    [u_train_norm_row, ~] = BasePINN.normalizeData(u_train.', normIn.mode, normIn);
+    [u_test_norm_row,  ~] = BasePINN.normalizeData(u_test.',  normIn.mode, normIn);
 
-    % 预测 train / test
-    v_train_pred = double(extractdata( ...
-        pinn.forward(dlarray(single(u_train'))))).';
-    v_test_pred = double(extractdata( ...
-        pinn.forward(dlarray(single(u_test'))))).';
+    % 2) 前向预测（归一化空间）
+    v_train_pred_norm_dl = pinn.forward(dlarray(single(u_train_norm_row)));
+    v_test_pred_norm_dl  = pinn.forward(dlarray(single(u_test_norm_row)));
+
+    v_train_pred_norm_row = double(extractdata(v_train_pred_norm_dl));
+    v_test_pred_norm_row  = double(extractdata(v_test_pred_norm_dl));
+
+    % 3) 反归一化回物理电压
+    v_train_pred_row = BasePINN.denormalizeData(v_train_pred_norm_row, normOut);
+    v_test_pred_row  = BasePINN.denormalizeData(v_test_pred_norm_row,  normOut);
+
+    v_train_pred = v_train_pred_row.';  % N_train x 1
+    v_test_pred  = v_test_pred_row.';   % N_test x 1
 
     mse_train = mean((v_train_pred - v_train).^2);
     mse_test  = mean((v_test_pred  - v_test).^2);
@@ -274,6 +328,72 @@ function plot_stage_loss(pinn, stageId, idxRange)
     legend('Total','Data','Phys','Mono','Smooth','Location','best');
     title(sprintf('Stage %d Loss History', stageId));
     grid on;
+end
+
+%% ================== 动态物理点采样函数 ==================
+function X_phys_dl = samplePhysicsPoints(pinn, ...
+    u_train_full, u_train_norm_row, ...
+    physParam, N_phys, mode)
+% 动态采样物理点
+%  - pinn: 已训练到当前阶段的 PINN 对象
+%  - u_train_full      : N_train x 1 (物理量)
+%  - u_train_norm_row  : 1 x N_train (归一化空间)
+%  - N_phys            : 本次要选多少个 collocation 点
+%  - mode              : 'random' | 'residual' | 'hybrid'
+
+    if nargin < 6 || isempty(mode)
+        mode = 'hybrid';
+    end
+
+    N_train = numel(u_train_full);
+
+    switch lower(mode)
+        case 'random'
+            idx_phys = randperm(N_train, min(N_phys, N_train));
+
+        case 'residual'
+            % 使用当前网络计算全局物理残差 |H(v_pred) - u|
+            [~, idx_phys] = residualTopK(pinn, u_train_full, u_train_norm_row, ...
+                                         physParam, N_phys);
+
+        otherwise % 'hybrid'：一半随机，一半残差大的
+            N1 = floor(N_phys/2);
+            N2 = N_phys - N1;
+
+            idx_rand = randperm(N_train, min(N1, N_train));
+            [~, idx_top] = residualTopK(pinn, u_train_full, u_train_norm_row, ...
+                                        physParam, min(N2, N_train));
+
+            idx_phys = unique([idx_rand(:); idx_top(:)]).';
+    end
+
+    % 取出对应的归一化 u_norm 作为 X_phys
+    u_phys_norm_seg = u_train_norm_row(:, idx_phys);  % 1 x N_phys
+    X_phys_dl = dlarray(single(u_phys_norm_seg));
+end
+
+function [e_sorted, idx_top] = residualTopK(pinn, u_train_full, u_train_norm_row, ...
+                                            physParam, K)
+    % 1) 在所有训练点上预测 v（归一化空间）
+    u_norm_dl = dlarray(single(u_train_norm_row));
+    v_norm_dl = pinn.forward(u_norm_dl);
+    v_norm    = double(extractdata(v_norm_dl));   % 1 x N
+
+    % 2) 反归一化到物理空间 v_phys
+    % 这里假定 pinn 内部有 applyDenormOut，如果没有可以改成:
+    %   v_phys_row = BasePINN.denormalizeData(v_norm, pinn.normOut);
+    v_phys_row = pinn.applyDenormOut(v_norm);
+    v_phys     = v_phys_row.';                    % N x 1
+
+    % 3) 正向迟滞模型
+    u_hat_dl = physicsFcn_GPI_forward(dlarray(single(v_phys.')), physParam);
+    u_hat    = double(extractdata(u_hat_dl)).';   % N x 1
+
+    % 4) 残差
+    e = abs(u_hat - u_train_full);               % N x 1
+    [e_sorted, idx_sorted] = sort(e, 'descend');
+    K = min(K, numel(e_sorted));
+    idx_top = idx_sorted(1:K);
 end
 ===== ./GPI_Model.m =====
 function [y,Fr1_updated] = GPI_Model(v, Fr1_previous)
@@ -740,14 +860,23 @@ classdef HysteresisInversePINN < BasePINN
     %   3) 单调性约束    L_mono
     %   4) 输出平滑项    L_smooth
     %
-    % X_data: 用于数据项和单调/平滑项的输入 u
-    % X_phys: 用于物理残差 H(v)≈u 的输入 u（可为子采样点）
+    % X_data: 用于数据项和单调/平滑项的输入 (归一化后的 u_norm)
+    % Y_data: 数据项目标输出 (归一化后的 v_norm)
+    % X_phys: 用于物理残差 H(v)≈u 的输入 (归一化后的 u_norm_phys)
+    %
+    % 归一化:
+    %   - 网络内部全部在归一化空间上工作 (u_norm, v_norm)
+    %   - 物理项: 先把 u_norm, v_norm 反归一化为物理量 u_phys, v_phys
+    %             再喂 physicsFcn(v_phys, physParam)
     % -----------------------------------------------------------
 
     properties
         physParam       % 正向迟滞模型参数
         lossWeights     % 结构体 {lambdaData, lambdaPhys, lambdaMono, lambdaSmooth}
         physicsFcn      % 正向迟滞算子 (function handle)
+
+        normIn          % 输入归一化参数 struct，字段至少包含 .mode
+        normOut         % 输出归一化参数 struct，字段至少包含 .mode
     end
 
     methods
@@ -757,55 +886,97 @@ classdef HysteresisInversePINN < BasePINN
             obj.physParam   = physParam;
             obj.lossWeights = lossWeights;
             obj.physicsFcn  = physicsFcn;
+
+            % 默认不做归一化
+            obj.normIn  = struct('mode','none');
+            obj.normOut = struct('mode','none');
+        end
+
+        %% 设置归一化参数（在 demo 中从训练数据统计后调用）
+        function setNormalization(obj, normIn, normOut)
+            if nargin >= 2 && ~isempty(normIn)
+                obj.normIn = normIn;
+            end
+            if nargin >= 3 && ~isempty(normOut)
+                obj.normOut = normOut;
+            end
+        end
+
+        %% 物理域预测接口（方便 demo / 将来 S-function 使用）
+        % u_phys: N×1 或 1×N (物理量)
+        % v_phys: 同维度 (物理量)
+        function v_phys = predictPhysical(obj, u_phys)
+            u_row = u_phys(:)';   % 1 x N
+            % 归一化输入
+            u_norm = obj.applyNormIn(u_row);
+            % 网络前向
+            u_norm_dl = dlarray(single(u_norm));
+            v_norm_dl = obj.forward(u_norm_dl);
+            v_norm    = double(extractdata(v_norm_dl));
+            % 反归一化输出
+            v_row = obj.applyDenormOut(v_norm);
+            v_phys = v_row(:);
         end
 
         %% ---------- 核心损失 ----------
-        function [loss, grads] = computeLoss(~, params, ...
+        function [loss, grads] = computeLoss(obj, params, ...
                                              X_data, Y_data, X_phys, ...
                                              physicsFcn, physParam, lossWeights)
+            % X_data, Y_data, X_phys 均在归一化空间
+            % X_*: 1 x N, dlarray(single)
+            % Y_*: 1 x N, dlarray(single)
 
             % -------------------------------
-            % 1) 数据前向：v_pred_data = f(u_data)
+            % 1) 数据前向：v_pred_data_norm = f(u_norm_data)
             % -------------------------------
-            v_pred_data = BasePINN.forwardWithParams(params, X_data);
+            v_pred_data_norm = BasePINN.forwardWithParams(params, X_data);
 
             % -------------------------------
-            % 2) 数据项 L_data
+            % 2) 数据项 L_data (归一化空间)
             % -------------------------------
             if lossWeights.lambdaData ~= 0
-                L_data = mean((v_pred_data - Y_data).^2, "all");
+                L_data = mean((v_pred_data_norm - Y_data).^2, "all");
             else
                 L_data = dlarray(single(0));
             end
 
             % -------------------------------
-            % 3) 物理一致性项 L_phys: H(v_pred_phys) ≈ u_phys
-            %    v_pred_phys 在 X_phys 上前向（可抽样）
+            % 3) 物理一致性项 L_phys: H(v_phys_pred) ≈ u_phys
+            %    先把 u_norm, v_norm 转回物理空间
             % -------------------------------
             if lossWeights.lambdaPhys ~= 0
-                v_pred_phys = BasePINN.forwardWithParams(params, X_phys);
-                u_hat = physicsFcn(v_pred_phys, physParam);
-                L_phys = mean((u_hat - X_phys).^2, "all");
+                % 3.1 归一化空间中预测
+                v_pred_phys_norm = BasePINN.forwardWithParams(params, X_phys);
+
+                % 3.2 反归一化到物理空间
+                u_phys = obj.applyDenormIn(X_phys);           % u_phys
+                v_phys = obj.applyDenormOut(v_pred_phys_norm);% v_phys
+
+                % 3.3 调用正向迟滞模型得到 u_hat
+                u_hat = physicsFcn(v_phys, physParam);        % 物理量
+
+                % 3.4 在物理空间上计算残差
+                L_phys = mean((u_hat - u_phys).^2, "all");
             else
                 L_phys = dlarray(single(0));
             end
 
             % -------------------------------
-            % 4) 单调性约束 L_mono （在 X_data 上 dv/du >= 0）
+            % 4) 单调性约束 L_mono （归一化空间 dv/du >= 0）
             % -------------------------------
             if lossWeights.lambdaMono ~= 0
-                dv_du = dlgradient(sum(v_pred_data), X_data);
-                mono_penalty = relu(-dv_du);      % 只惩罚 dv/du<0 部分
+                dv_du = dlgradient(sum(v_pred_data_norm, "all"), X_data);
+                mono_penalty = relu(-dv_du);   % 只惩罚 dv/du<0 部分
                 L_mono = mean(mono_penalty.^2, "all");
             else
                 L_mono = dlarray(single(0));
             end
 
             % -------------------------------
-            % 5) 输出平滑项 L_smooth （在 X_data 上）
+            % 5) 输出平滑项 L_smooth （归一化空间）
             % -------------------------------
             if lossWeights.lambdaSmooth ~= 0
-                v_seq = v_pred_data;
+                v_seq = v_pred_data_norm;
                 if size(v_seq,2) > 1
                     dv = v_seq(:,2:end) - v_seq(:,1:end-1);
                     L_smooth = mean(dv.^2, "all");
@@ -830,62 +1001,113 @@ classdef HysteresisInversePINN < BasePINN
             % -------------------------------
             grads = dlgradient(loss, params);
         end
+    end
 
-        %% ---------- 拆分各项损失（给 Base / demo 记录用） ----------
-        function Lvec = evalLossComponents(~, params, ...
-                                           X_data, Y_data, X_phys, ...
-                                           physicsFcn, physParam, lossWeights)
-            % 与 computeLoss 类似，但返回数值向量:
-            % Lvec = [Ltotal, Ldata, Lphys, Lmono, Lsmooth]
-
-            % 1) data forward
-            v_pred_data = BasePINN.forwardWithParams(params, X_data);
-
-            % 2) L_data
-            if lossWeights.lambdaData ~= 0
-                L_data_dl = mean((v_pred_data - Y_data).^2, "all");
-                Ldata = double(extractdata(L_data_dl));
-            else
-                Ldata = 0;
+    %% ========== 工具：dlarray 友好的归一化/反归一化 ==========
+    methods (Access = public)
+        % 对输入 u 做归一化 (网络输入前用)
+        function u_n = applyNormIn(obj, u)
+            % u: 1 x N (double or dlarray)
+            mode = 'none';
+            if isfield(obj.normIn, 'mode')
+                mode = lower(obj.normIn.mode);
             end
 
-            % 3) L_phys
-            if lossWeights.lambdaPhys ~= 0
-                v_pred_phys = BasePINN.forwardWithParams(params, X_phys);
-                u_hat = physicsFcn(v_pred_phys, physParam);
-                L_phys_dl = mean((u_hat - X_phys).^2, "all");
-                Lphys = double(extractdata(L_phys_dl));
-            else
-                Lphys = 0;
+            switch mode
+                case 'zscore'
+                    mu    = obj.normIn.mu;
+                    sigma = obj.normIn.sigma;
+                    if sigma == 0, sigma = 1; end
+                    u_n = (u - mu) ./ sigma;
+
+                case 'minmax'
+                    xmin = obj.normIn.xmin;
+                    xmax = obj.normIn.xmax;
+                    denom = xmax - xmin;
+                    if denom == 0, denom = 1; end
+                    u_n = (u - xmin) ./ denom;
+
+                otherwise
+                    u_n = u;
+            end
+        end
+
+        % 对输入的归一化值做反归一化 (物理项中恢复 u_phys)
+        function u = applyDenormIn(obj, u_n)
+            % u_n: 1 x N (dlarray)
+            mode = 'none';
+            if isfield(obj.normIn, 'mode')
+                mode = lower(obj.normIn.mode);
             end
 
-            % 4) L_mono
-            if lossWeights.lambdaMono ~= 0
-                dv_du = dlgradient(sum(v_pred_data), X_data);
-                mono_penalty = relu(-dv_du);
-                L_mono_dl = mean(mono_penalty.^2, "all");
-                Lmono = double(extractdata(L_mono_dl));
-            else
-                Lmono = 0;
+            switch mode
+                case 'zscore'
+                    mu    = obj.normIn.mu;
+                    sigma = obj.normIn.sigma;
+                    if sigma == 0, sigma = 1; end
+                    u = u_n .* sigma + mu;
+
+                case 'minmax'
+                    xmin = obj.normIn.xmin;
+                    xmax = obj.normIn.xmax;
+                    denom = xmax - xmin;
+                    if denom == 0, denom = 1; end
+                    u = u_n .* denom + xmin;
+
+                otherwise
+                    u = u_n;
+            end
+        end
+
+        % 对输出 v 做归一化 / 反归一化
+        function v_n = applyNormOut(obj, v)
+            mode = 'none';
+            if isfield(obj.normOut, 'mode')
+                mode = lower(obj.normOut.mode);
             end
 
-            % 5) L_smooth
-            if lossWeights.lambdaSmooth ~= 0 && size(v_pred_data,2) > 1
-                dv = v_pred_data(:,2:end) - v_pred_data(:,1:end-1);
-                L_smooth_dl = mean(dv.^2, "all");
-                Lsmooth = double(extractdata(L_smooth_dl));
-            else
-                Lsmooth = 0;
+            switch mode
+                case 'zscore'
+                    mu    = obj.normOut.mu;
+                    sigma = obj.normOut.sigma;
+                    if sigma == 0, sigma = 1; end
+                    v_n = (v - mu) ./ sigma;
+
+                case 'minmax'
+                    xmin = obj.normOut.xmin;
+                    xmax = obj.normOut.xmax;
+                    denom = xmax - xmin;
+                    if denom == 0, denom = 1; end
+                    v_n = (v - xmin) ./ denom;
+
+                otherwise
+                    v_n = v;
+            end
+        end
+
+        function v = applyDenormOut(obj, v_n)
+            mode = 'none';
+            if isfield(obj.normOut, 'mode')
+                mode = lower(obj.normOut.mode);
             end
 
-            % 6) 总损失（按 lambda 加权）
-            Ltotal = ...
-                lossWeights.lambdaData   * Ldata   + ...
-                lossWeights.lambdaPhys   * Lphys   + ...
-                lossWeights.lambdaMono   * Lmono   + ...
-                lossWeights.lambdaSmooth * Lsmooth;
+            switch mode
+                case 'zscore'
+                    mu    = obj.normOut.mu;
+                    sigma = obj.normOut.sigma;
+                    if sigma == 0, sigma = 1; end
+                    v = v_n .* sigma + mu;
 
-            Lvec = [Ltotal, Ldata, Lphys, Lmono, Lsmooth];
+                case 'minmax'
+                    xmin = obj.normOut.xmin;
+                    xmax = obj.normOut.xmax;
+                    denom = xmax - xmin;
+                    if denom == 0, denom = 1; end
+                    v = v_n .* denom + xmin;
+
+                otherwise
+                    v = v_n;
+            end
         end
     end
 end
