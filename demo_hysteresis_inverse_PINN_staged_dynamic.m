@@ -263,6 +263,18 @@ legend('Location','best');
 title('Hysteresis loop comparison');
 grid on;
 
+function record_loss(pinn, params, Xd, Yd, Xp, physFcn, physParam, W)
+    Lvec = dlfeval(@BasePINN.evalWrapper, pinn, params, ...
+                   Xd, Yd, Xp, physFcn, physParam, W);
+    pinn.lossHistory.iter(end+1)  = pinn.iteration;
+    pinn.lossHistory.total(end+1) = double(Lvec(1));
+    if isempty(pinn.lossHistory.components)
+        pinn.lossHistory.components = double(Lvec(:));
+    else
+        pinn.lossHistory.components(:, end+1) = double(Lvec(:));
+    end
+end
+
 %% ================== 辅助绘图函数 ==================
 function plot_stage_fit(pinn, stageId, t_train, u_train, v_train, ...
                         t_test,  u_test,  v_test, ...

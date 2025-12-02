@@ -74,6 +74,46 @@ classdef HysteresisInversePINN < BasePINN
             % X_*: 1 x N, dlarray(single)
             % Y_*: 1 x N, dlarray(single)
 
+            [L_data, L_phys, L_mono, L_smooth] = obj.computeLossTerms( ...
+                params, X_data, Y_data, X_phys, physicsFcn, physParam, lossWeights);
+
+            % -------------------------------
+            % 总损失
+            % -------------------------------
+            loss = ...
+                lossWeights.lambdaData   * L_data   + ...
+                lossWeights.lambdaPhys   * L_phys   + ...
+                lossWeights.lambdaMono   * L_mono   + ...
+                lossWeights.lambdaSmooth * L_smooth;
+
+            % -------------------------------
+            % 梯度
+            % -------------------------------
+            grads = dlgradient(loss, params);
+        end
+        
+        function Lvec = evalLossComponents(obj, params, ...
+                                           X_data, Y_data, X_phys, ...
+                                           physicsFcn, physParam, lossWeights)
+            [L_data, L_phys, L_mono, L_smooth] = obj.computeLossTerms( ...
+                params, X_data, Y_data, X_phys, physicsFcn, physParam, lossWeights);
+
+            % ---------- 总损失 ----------
+            L_total = ...
+                lossWeights.lambdaData   * L_data + ...
+                lossWeights.lambdaPhys   * L_phys + ...
+                lossWeights.lambdaMono   * L_mono + ...
+                lossWeights.lambdaSmooth * L_smooth;
+
+            % 返回 vector（BasePINN 要求第一项必须是 total）
+            Lvec = [L_total; L_data; L_phys; L_mono; L_smooth];
+        end
+
+    end
+
+    methods (Access = private)
+        function [L_data, L_phys, L_mono, L_smooth] = computeLossTerms(obj, params, ...
+                X_data, Y_data, X_phys, physicsFcn, physParam, lossWeights)
             % -------------------------------
             % 1) 数据前向：v_pred_data_norm = f(u_norm_data)
             % -------------------------------
@@ -134,75 +174,6 @@ classdef HysteresisInversePINN < BasePINN
             else
                 L_smooth = dlarray(single(0));
             end
-
-            % -------------------------------
-            % 6) 总损失
-            % -------------------------------
-            loss = ...
-                lossWeights.lambdaData   * L_data   + ...
-                lossWeights.lambdaPhys   * L_phys   + ...
-                lossWeights.lambdaMono   * L_mono   + ...
-                lossWeights.lambdaSmooth * L_smooth;
-
-            % -------------------------------
-            % 7) 梯度
-            % -------------------------------
-            grads = dlgradient(loss, params);
-        end
-        
-        function Lvec = evalLossComponents(obj, params, ...
-                                           X_data, Y_data, X_phys, ...
-                                           physicsFcn, physParam, lossWeights)
-            % ---------- 数据项 ----------
-            v_pred_data_norm = BasePINN.forwardWithParams(params, X_data);
-            if lossWeights.lambdaData ~= 0
-                L_data = mean((v_pred_data_norm - Y_data).^2, "all");
-            else
-                L_data = dlarray(single(0));
-            end
-        
-            % ---------- 物理项 ----------
-            if lossWeights.lambdaPhys ~= 0
-                v_pred_phys_norm = BasePINN.forwardWithParams(params, X_phys);
-                u_phys = obj.applyDenormIn(X_phys);
-                v_phys = obj.applyDenormOut(v_pred_phys_norm);
-                u_hat  = physicsFcn(v_phys, physParam);
-                L_phys = mean((u_hat - u_phys).^2, "all");
-            else
-                L_phys = dlarray(single(0));
-            end
-        
-            % ---------- 单调性项 ----------
-            if lossWeights.lambdaMono ~= 0
-                dv_du = dlgradient(sum(v_pred_data_norm, "all"), X_data);
-                mono_penalty = relu(-dv_du);
-                L_mono = mean(mono_penalty.^2, "all");
-            else
-                L_mono = dlarray(single(0));
-            end
-        
-            % ---------- 平滑项 ----------
-            if lossWeights.lambdaSmooth ~= 0
-                v_seq = v_pred_data_norm;
-                if size(v_seq,2) > 1
-                    dv = v_seq(:,2:end) - v_seq(:,1:end-1);
-                    L_smooth = mean(dv.^2, "all");
-                else
-                    L_smooth = dlarray(single(0));
-                end
-            else
-                L_smooth = dlarray(single(0));
-            end
-        
-            % ---------- 总损失 ----------
-            L_total = ...
-                lossWeights.lambdaData   * L_data + ...
-                lossWeights.lambdaPhys   * L_phys + ...
-                lossWeights.lambdaMono   * L_mono + ...
-                lossWeights.lambdaSmooth * L_smooth;
-        
-            % 返回 vector（BasePINN 要求第一项必须是 total）
-            Lvec = [L_total; L_data; L_phys; L_mono; L_smooth];
         end
     
     end
