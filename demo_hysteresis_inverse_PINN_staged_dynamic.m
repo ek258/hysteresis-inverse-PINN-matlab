@@ -4,9 +4,6 @@
 % - 训练结束后画总的拟合 + loss + 滞回曲线
 % - Stage 2 / Stage 3 使用“分段训练 + 每段前动态重采样物理点”
 
-clear; clc; close all;
-rng(0);
-
 %% ===== 0. 一些训练超参数 =====
 % 时间与采样
 dt      = 1e-3;
@@ -78,7 +75,7 @@ physParam.P   = [0.7460 0.1860 0.0650 0.0855 0.0362 -0.1159];
 layers = [1 64 64 1];
 dummyWeights = struct('lambdaData',1,'lambdaPhys',0,'lambdaMono',0,'lambdaSmooth',0);
 pinn = HysteresisInversePINN(layers, physParam, dummyWeights, @physicsFcn_GPI_forward);
-
+clear layers
 % 设置归一化参数（供 computeLoss / 其他方法内部使用）
 % 假定你在 HysteresisInversePINN 里已经实现了 setNormalization / applyDenormOut 等
 pinn.setNormalization(normIn, normOut);

@@ -27,10 +27,9 @@ classdef BasePINN < handle
         % 网络参数
         paramsNet       % 结构 W1,b1,...,WL,bL
         layers
-        
+
         % 物理参数（由子类在构造函数中填充）
-        paramsPhys 
-        trainablePhysParams = {}
+        paramsPhys      % 结构 (例如 eta, r, P, rd)
 
         % Adam 状态（网络参数）
         adamAvgNet
@@ -116,25 +115,18 @@ classdef BasePINN < handle
                 end
 
                 % ---------------- Adam 更新：物理参数 ----------------
-                if ~isempty(obj.trainablePhysParams)
-                    fnPhys = fieldnames(obj.paramsPhys);
-                    for i = 1:numel(fnPhys)
-                        name = fnPhys{i};
-                
-                        if ~any(strcmp(name, obj.trainablePhysParams))
-                            continue;   % 跳过不希望训练的参数
-                        end
-                
-                        % Adam 更新
-                        [obj.paramsPhys.(name), ...
-                         obj.adamAvgPhys.(name), ...
-                         obj.adamAvgSqPhys.(name)] = ...
-                            adamupdate( ...
-                                obj.paramsPhys.(name), gradsPhys.(name), ...
-                                obj.adamAvgPhys.(name), obj.adamAvgSqPhys.(name), ...
-                                obj.iteration, lrPhys);
-                    end
+                fnPhys = fieldnames(obj.paramsPhys);
+                for i = 1:numel(fnPhys)
+                    name = fnPhys{i};
+                    [obj.paramsPhys.(name), ...
+                     obj.adamAvgPhys.(name), ...
+                     obj.adamAvgSqPhys.(name)] = ...
+                        adamupdate( ...
+                            obj.paramsPhys.(name), gradsPhys.(name), ...
+                            obj.adamAvgPhys.(name), obj.adamAvgSqPhys.(name), ...
+                            obj.iteration, lrPhys);
                 end
+
                 % ---------------- 记录损失（含多项组件） ----------------
                 if ismethod(obj, 'evalLossComponents')
                     % Lvec: [L_total; L1; L2; ...]

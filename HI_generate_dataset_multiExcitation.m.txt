@@ -1,0 +1,100 @@
+%% ================================================================
+% generate_dataset_multiExcitation.m
+% 生成多种激励曲线 -> 经 GPI_Model 生成响应 u
+% 自动切分 train/test + 归一化 + 保存
+%
+% 输出文件: dataset_multiExcitations.mat
+%
+% 作者：ChatGPT
+% ================================================================
+
+clear; clc; close all;
+rng(0);
+
+%% ---------- 1. 全局时间轴 ----------
+dt      = 1e-3;
+T_end   = 1.2;
+t       = (0:dt:T_end-dt).';
+N       = numel(t);
+
+%% ---------- 2. 定义激励曲线列表 ----------
+% 你可以自由扩展或增加更多激励
+excitationList = {};
+
+% ① 单频正弦
+excitationList{end+1} = 5 + 4*sin(2*pi*1*t);
+
+% ② 多频激励
+excitationList{end+1} = 5 + 3*sin(2*pi*1*t) + 2*sin(2*pi*3*t) + 1.2*sin(2*pi*7*t);
+
+% ③ Chirp (0.1Hz → 30Hz)
+excitationList{end+1} = 5 + 4*chirp(t, 0.1, t(end), 30);
+
+% ④ 随机阶跃序列
+stepSig              = 5 + 4*idinput(N, 'prbs');  % PRBS 随机二值序列
+excitationList{end+1}= stepSig;
+
+% 限幅
+for i = 1:numel(excitationList)
+    excitationList{i} = max(0, min(10, excitationList{i}));
+end
+
+%% ---------- 3. GPI forward 生成 u_all ----------
+fprintf("Generating GPI responses...\n");
+
+v_all = [];   % 输入
+u_all = [];   % 输出（GPI）
+
+for idx = 1:numel(excitationList)
+    v_seq = excitationList{idx};
+    Fr = [];  % Play operator 内部存储
+    u_seq = zeros(size(v_seq));
+
+    for k = 1:N
+        [u_seq(k), Fr] = GPI_Model(v_seq(k), Fr);   % 调用你项目中的模型
+    end
+
+    % 记录
+    v_all = [v_all; v_seq];   %#ok<AGROW>
+    u_all = [u_all; u_seq];   %#ok<AGROW>
+end
+
+% 最终数据维度： (numExcitations * N) x 1
+fprintf("Total dataset size: %d samples\n", numel(v_all));
+
+%% ---------- 4. Train / Test 切分 ----------
+train_ratio = 0.8;
+N_total = numel(v_all);
+N_train = floor(N_total * train_ratio);
+
+idx_train = 1:N_train;
+idx_test  = N_train+1:N_total;
+
+u_train = u_all(idx_train);
+v_train = v_all(idx_train);
+
+u_test  = u_all(idx_test);
+v_test  = v_all(idx_test);
+
+%% ---------- 5. 归一化 ----------
+[u_train_norm, normIn]  = BasePINN.normalizeData(u_train.', 'zscore');
+[v_train_norm, normOut] = BasePINN.normalizeData(v_train.', 'zscore');
+
+[u_test_norm,  ~] = BasePINN.normalizeData(u_test.',  'zscore', normIn);
+[v_test_norm,  ~] = BasePINN.normalizeData(v_test.',  'zscore', normOut);
+
+%% ---------- 6. 保存 ----------
+save('dataset_multiExcitations.mat', ...
+    't', 'dt', 'excitationList', ...
+    'u_all','v_all', ...
+    'u_train','v_train','u_test','v_test', ...
+    'u_train_norm','v_train_norm','u_test_norm','v_test_norm', ...
+    'normIn','normOut');
+
+fprintf("dataset_multiExcitations.mat 已保存。\n");
+
+%% ---------- 7. 绘图查看 ----------
+figure; hold on; box on;
+plot(v_all(1:N), u_all(1:N), 'b');
+xlabel('v (Voltage)'); ylabel('u (Displacement)');
+title('Hysteresis Curve (Example excitation)');
