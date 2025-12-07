@@ -65,10 +65,11 @@ function [ previous_text_len ] = mat_progress_bar(varargin)
     %% accumulate total time
     if isempty(total_t)
         total_t = 0;
+    elseif previous_text_len == 0
+        total_t = t;
     else
         total_t = total_t + t;
     end
-
     %% remaining time estimation
     remain_t = t*(max_index - current_index);
     remain_t_h = floor(remain_t/3600);

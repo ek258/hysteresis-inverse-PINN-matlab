@@ -3,38 +3,43 @@ clear; clc; close all;
 rng(0);
 
 %% ======================= 0. 加载数据 & 构建网络 ==========================
-load('dataset_GPI_dl.mat','dataset');
+load('dataset_GPI_dl_20251208.mat');
+load('modelsPINN_preTrained_20251208.mat')
 
-pinn = HysteresisInversePINN( ...
-    [1 64 64 1], ... 
-    struct( ... 
-        'rd', [-8 -6 -4 -2 0 2 4 6 8], ...
-        'eta',[1 1 1 1 1.2437 -0.1103 -0.0787 -0.1742 -0.1767], ...
-        'r',  [0 1 2 3 4 5], ...
-        'P',  [0.7460 0.1860 0.0650 0.0855 0.0362 -0.1159]), ...
-    struct('lambdaData',1,'lambdaPhys',0,'lambdaMono',0,'lambdaSmooth',0), ...
-    @GPI_forward_dl);
-
-pinn.setNormalization(dataset.normIn, dataset.normOut);
+% pinn = HysteresisInversePINN( ...
+%     [1 64 64 64 1], ... 
+%     struct( ... 
+%         'rd', [-8 -6 -4 -2 0 2 4 6 8], ...
+%         'eta',[1 1 1 1 1.2437 -0.1103 -0.0787 -0.1742 -0.1767], ...
+%         'r',  [0 1 2 3 4 5], ...
+%         'P',  [0.7460 0.1860 0.0650 0.0855 0.0362 -0.1159]), ...
+%     struct('lambdaData',1,'lambdaPhys',0,'lambdaMono',0,'lambdaSmooth',0), ...
+%     @GPI_forward_dl);
+% pinn.setNormalization(dataset.normIn, dataset.normOut);
 
 %% ======================= 训练参数表 ==========================
 trainParamList = {};
 
 trainParamList{end+1} = struct( ...
     'name', 'Stage1', 'train_ratio', 0.8, ...
-    'epochs', 1000, 'lr', 1e-3, ...
+    'epochs', 200, 'lrNet', 1e-3, 'lrPhys', 1e-4, ...
+    'trainablePhysParams', {{}}, ...
+    'lossWeights', struct('lambdaData',1,'lambdaPhys',0,'lambdaMono',0,'lambdaSmooth',0) );
+trainParamList{end+1} = struct( ...
+    'name', 'Stage1', 'train_ratio', 0.8, ...
+    'epochs', 1200, 'lrNet', 1e-4, 'lrPhys', 1e-4, ...
     'trainablePhysParams', {{}}, ...
     'lossWeights', struct('lambdaData',1,'lambdaPhys',0,'lambdaMono',0,'lambdaSmooth',0) );
 
 trainParamList{end+1} = struct( ...
     'name', 'Stage2', 'train_ratio', 0.8, ...
-    'epochs', 2000, 'lr', 1e-3, ...
+    'epochs', 100, 'lrNet', 5e-4, 'lrPhys', 1e-4, ...
     'trainablePhysParams', {{}}, ...
     'lossWeights', struct('lambdaData',1,'lambdaPhys',10,'lambdaMono',0,'lambdaSmooth', 0) );
 
 trainParamList{end+1} = struct( ...
     'name', 'Stage3', 'train_ratio', 0.8, ...
-    'epochs', 2000, 'lr', 2e-3, ...
+    'epochs', 100, 'lrNet', 1e-4, 'lrPhys', 1e-4, ...
     'trainablePhysParams', {{}}, ...
     'lossWeights', struct('lambdaData',1,'lambdaPhys',1,'lambdaMono',1e-3,'lambdaSmooth',1e-4) );
 
@@ -46,11 +51,18 @@ if true
                 dataset.groups(indexGroup), ...
                 trainParamList{indexStage}, ...
                 dataset.normIn, dataset.normOut);
-            pause(1)
+            pause(1) % 等待画图
         end
-        pause
+        pause(1)
     end
 end
+
+trainProcessData.lossHistory = pinn.lossHistory;
+pinn.clearLossHistory();
+trainProcessData.dataset = dataset;
+trainProcessData.trainParamList = trainParamList;
+save('trainProcessData_pre1.mat', 'trainProcessData');
+save('modelsPINN_preTrained', 'pinn');
 
 %% ================== 训练单阶段 ==================
 function pinn = trainOneStage(pinn, group, param, normIn, normOut)
@@ -83,8 +95,8 @@ function pinn = trainOneStage(pinn, group, param, normIn, normOut)
         pinn.physicsFcn, ...    % 正向迟滞模型
         pinn.lossWeights, ...   % 损失权重
         param.epochs, ...       % 轮数
-        param.lr, ...           % lrNet
-        param.lr );             % lrPhys
+        param.lrNet, ...        % lrNet
+        param.lrPhys );         % lrPhys
 
     endIdx = numel(pinn.lossHistory.iter);
     titleName = char(sprintf("%s | Group %s", param.name, group.name));
@@ -107,8 +119,8 @@ function plot_stage_summary(pinn, group, param, normIn, normOut, titleName, idxR
 
     % ===== 打印训练参数 =====
     fprintf('Plot summary for %s: ', param.name);
-    fprintf('train_ratio=%.2f, epochs=%d, lr=%.2g\n', ...
-        param.train_ratio, param.epochs, param.lr);
+    fprintf('train_ratio=%.2f, epochs=%d, lrNet=%.2g, lrPhys=%.2g\n', ...
+        param.train_ratio, param.epochs, param.lrNet, param.lrPhys);
     if isfield(param,'lossWeights')
         lw = param.lossWeights;
         fprintf('  lossWeights: data=%.2g, phys=%.2g, mono=%.2g, smooth=%.2g\n', ...
@@ -139,23 +151,18 @@ function plot_stage_summary(pinn, group, param, normIn, normOut, titleName, idxR
     if nargin < 6 || isempty(titleName)
         titleName = param.name;
     end
-    h = figure('Name',[char(titleName) ' Summary']);
-
-    warning('off','MATLAB:HandleGraphics:ObsoletedProperty:JavaFrame');    % 关闭相关的警告提示（因为调用了非公开接口）
-    jFrame = get(h,'JavaFrame');    % 获取底层 Java 结构相关句柄吧
-    set(jFrame,'Maximized',1);    %设置其最大化为真（0 为假）
-    pause(0.1);    % 实践中设定最大化之后需要停顿一下，否则后续获取窗口尺寸可能还是默认大小
-    % warning('on','MATLAB:HandleGraphics:ObsoletedProperty:JavaFrame');    % 打开相关警告设置
+    figure('Name',[char(titleName) ' Summary']);
 
     %% ================== 1) Loss 曲线 ==================
-    subplot(3,1,1); hold on; box on;
+    subplot(2,1,1); hold on; box on;
 
     if ~isempty(pinn.lossHistory.components)
         if nargin < 7 || isempty(idxRange)
             idxRange = 1:numel(pinn.lossHistory.iter);
         end
 
-        it   = pinn.lossHistory.iter(idxRange);
+        % it   = pinn.lossHistory.iter(idxRange);
+        it   = idxRange - idxRange(1);
         Lall = pinn.lossHistory.components(:, idxRange);
 
         Ltotal = Lall(1,:);
@@ -200,7 +207,7 @@ function plot_stage_summary(pinn, group, param, normIn, normOut, titleName, idxR
     mse_train = mean((v_train_pred - v_train).^2);
     mse_test  = mean((v_test_pred  - v_test).^2);
 
-    subplot(3,1,2); hold on; box on;
+    subplot(2,1,2); hold on; box on;
     plot(t_train, v_train,      'b','LineWidth',1.2);
     plot(t_train, v_train_pred, 'r--','LineWidth',1.2);
     plot(t_test,  v_test,       'c','LineWidth',1.0);
@@ -211,18 +218,32 @@ function plot_stage_summary(pinn, group, param, normIn, normOut, titleName, idxR
     grid on;
 
     %% ================== 3) 滞回曲线 u-v ==================
-    % 用全序列 u_raw -> v_true / v_pred
-    [u_norm_all_row, ~] = BasePINN.normalizeData(u.', normIn.mode, normIn);
-    v_pred_all_norm_dl  = pinn.forward(dlarray(single(u_norm_all_row)));
-    v_pred_all_norm_row = double(extractdata(v_pred_all_norm_dl));
-    v_pred_all_row      = BasePINN.denormalizeData(v_pred_all_norm_row, normOut);
-    v_pred_all          = v_pred_all_row.';   % N x 1
+    % % 全序列 u_raw -> v_pred -> u_hat_pred(通过正向GPI)
+    % 
+    % u_raw = u(:)';  % 1×N
+    % v_raw = v(:)';
+    % 
+    % % 1) 归一化 u_raw
+    % [u_norm_all_row, ~] = BasePINN.normalizeData(u_raw, normIn.mode, normIn);
+    % 
+    % % 2) PINN 逆模型预测 v_pred_norm
+    % v_pred_norm_dl  = pinn.forward(dlarray(single(u_norm_all_row)));
+    % v_pred_norm_row = double(extractdata(v_pred_norm_dl));
+    % 
+    % % 3) 反归一化到物理电压 v_pred_phys
+    % v_pred_phys_row = BasePINN.denormalizeData(v_pred_norm_row, normOut);
+    % v_pred_phys     = v_pred_phys_row';    % N×1
+    % 
+    % % 4) 正向 GPI：v_pred_phys -> u_hat_pred
+    % u_hat_pred_dl = pinn.physicsFcn(dlarray(single(v_pred_phys')), pinn.paramsPhys);
+    % u_hat_pred    = double(extractdata(u_hat_pred_dl))';
+    % 
+    % subplot(3,1,3); hold on; box on;
+    % plot(v_raw, u_raw,       'b.', 'DisplayName','True');
+    % plot(v_pred_phys, u_hat_pred, 'r.', 'DisplayName','Pred (inverse→forward)');
+    % xlabel('v'); ylabel('u');
+    % title('Hysteresis Loop');
+    % legend('Location','best');
+    % grid on;
 
-    subplot(3,1,3); hold on; box on;
-    plot(u, v,         'b.', 'DisplayName','True');
-    plot(u, v_pred_all,'r.', 'DisplayName','Pred');
-    xlabel('u'); ylabel('v');
-    title('Hysteresis (u-v)');
-    legend('Location','best');
-    grid on;
 end

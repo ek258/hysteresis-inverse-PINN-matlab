@@ -12,7 +12,7 @@ addpath('.');
 
 %% ====================== 1. 时间参数（全部保存） ====================
 dt    = 1e-3;
-T_end = 1.2;
+T_end = 5;
 t     = (0:dt:T_end-dt).';
 N     = numel(t);
 
@@ -24,7 +24,7 @@ excitationList{end+1} = @(t) 5 + 3*sin(2*pi*20*t);     % 高频正弦
 excitationList{end+1} = @(t) 5 + 3*sin(2*pi*1*t) + ...
                               2*sin(2*pi*5*t) + ...
                               1*sin(2*pi*15*t);        % 多频组合
-excitationList{end+1} = @(t) 5 + 4*prbs_signal(N);
+excitationList{end+1} = @(t) 5 + 4*idinput(N,'prbs');
 
 % —— Chirp
 excitationList{end+1} = @(t) 5 + 4*chirp(t,0.1,t(end),50);
@@ -76,8 +76,8 @@ end
 %% ====================== 5. 全局归一化 ==============================
 fprintf("Computing global normalization...\n");
 
-[all_v_norm, normIn]  = BasePINN.normalizeData(all_v, 'zscore');
-[all_u_norm, normOut] = BasePINN.normalizeData(all_u, 'zscore');
+[all_v_norm, normOut]  = BasePINN.normalizeData(all_v, 'zscore');
+[all_u_norm, normIn] = BasePINN.normalizeData(all_u, 'zscore');
 
 cursor = 1;
 for k = 1:numGroups
@@ -98,8 +98,3 @@ dataset.theta = theta;
 save('dataset_GPI_dl.mat','dataset');
 fprintf("Done. Saved as dataset_GPI_dl.mat\n");
 
-%% (helper) 生成PRBS 序列
-function v = prbs_signal(N)
-    prbs_full = idinput(2047,'prbs');  % 完整序列
-    v = prbs_full(1:N);
-end

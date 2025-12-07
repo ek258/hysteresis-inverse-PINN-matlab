@@ -1,123 +1,228 @@
-%% 
-
+%% ======================= PINN 逆迟滞模型 Demo ==========================
 clear; clc; close all;
 rng(0);
 
 %% ======================= 0. 加载数据 & 构建网络 ==========================
 load('dataset_GPI_dl.mat','dataset');
 
-pinn = HysteresisInversePINN(...
+pinn = HysteresisInversePINN( ...
     [1 64 64 1], ... 
     struct( ... 
         'rd', [-8 -6 -4 -2 0 2 4 6 8], ...
-        'eta', [1 1 1 1 1.2437 -0.1103 -0.0787 -0.1742 -0.1767], ...
-        'r', [0 1 2 3 4 5], ...
-        'P', [0.7460 0.1860 0.0650 0.0855 0.0362 -0.1159]), ...
-    struct('lambdaData', 1, 'lambdaPhys', 0, 'lambdaMono', 0, 'lambdaSmooth', 0), ...
-    @GPI_forward_dl); 
+        'eta',[1 1 1 1 1.2437 -0.1103 -0.0787 -0.1742 -0.1767], ...
+        'r',  [0 1 2 3 4 5], ...
+        'P',  [0.7460 0.1860 0.0650 0.0855 0.0362 -0.1159]), ...
+    struct('lambdaData',1,'lambdaPhys',0,'lambdaMono',0,'lambdaSmooth',0), ...
+    @GPI_forward_dl);
+
 pinn.setNormalization(dataset.normIn, dataset.normOut);
 
+%% ======================= 训练参数表 ==========================
 trainParamList = {};
-trainParamList{end+1} = struct('name', 'Stage1', 'train_ratio', 0.8, ...
+
+trainParamList{end+1} = struct( ...
+    'name', 'Stage1', 'train_ratio', 0.8, ...
+    'epochs', 1000, 'lr', 1e-3, ...
+    'trainablePhysParams', {{}}, ...
+    'lossWeights', struct('lambdaData',1,'lambdaPhys',0,'lambdaMono',0,'lambdaSmooth',0) );
+
+trainParamList{end+1} = struct( ...
+    'name', 'Stage2', 'train_ratio', 0.8, ...
     'epochs', 2000, 'lr', 1e-3, ...
-    'lossWeights', struct('lambdaData', 1, 'lambdaPhys', 0, ...
-        'lambdaMono', 0, 'lambdaSmooth', 0));
-trainParamList{end+1} = struct('name', 'Stage2', 'train_ratio', 0.8, ...
-    'epochs', 2000, 'lr', 1e-3, ...
-    'lossWeights', struct('lambdaData', 1, 'lambdaPhys', 0, ...
-        'lambdaMono', 0, 'lambdaSmooth', 0));
-trainParamList{end+1} = struct('name', "Stage3", 'train_ratio', 0.8, ...
-    'epochs', 2000, 'lr', 1e-3, ...
-    'lossWeights', struct('lambdaData', 1, 'lambdaPhys', 0, ...
-        'lambdaMono', 0, 'lambdaSmooth', 0));
+    'trainablePhysParams', {{}}, ...
+    'lossWeights', struct('lambdaData',1,'lambdaPhys',10,'lambdaMono',0,'lambdaSmooth', 0) );
+
+trainParamList{end+1} = struct( ...
+    'name', 'Stage3', 'train_ratio', 0.8, ...
+    'epochs', 2000, 'lr', 2e-3, ...
+    'trainablePhysParams', {{}}, ...
+    'lossWeights', struct('lambdaData',1,'lambdaPhys',1,'lambdaMono',1e-3,'lambdaSmooth',1e-4) );
 
 %% ======================= 1. 主训练循环 ==========================
 if true
-    for stageIndex = 1:numel(trainParamList)
-        for groupIndex = 1:numel(dataset.groups)
-            trainOneStage(pinn, dataset.groups(groupIndex), trainParamList(stageIndex));
-            % (待完成)绘制loss曲线、拟合曲线、预测曲线、滞回曲线，在一个图窗中
+    for indexStage = 1:numel(trainParamList)
+        for indexGroup = 1:numel(dataset.groups)
+            pinn = trainOneStage(pinn, ...
+                dataset.groups(indexGroup), ...
+                trainParamList{indexStage}, ...
+                dataset.normIn, dataset.normOut);
+            pause(1)
         end
+        pause
     end
 end
 
-function pinn = trainOneStage(pinn, group, param)
-    fprintf("\n===== Training %s =====\n", param.name);
+%% ================== 训练单阶段 ==================
+function pinn = trainOneStage(pinn, group, param, normIn, normOut)
+    fprintf("\n=== %s | Group %s ===\n", param.name, group.name);
+    if isempty(pinn.lossHistory.iter)
+        startIdx = 1;
+    else
+        startIdx = numel(pinn.lossHistory.iter) + 1;
+    end
 
+    % 训练集划分（用归一化后的 u_norm / v_norm）
     Ntr = floor(param.train_ratio * numel(group.u_norm));
     Xdl = dlarray(single(group.u_norm(1:Ntr)));
     Ydl = dlarray(single(group.v_norm(1:Ntr)));
 
-    pinn.lossWeights = param.lambda;
-    pinn.train(Xdl, Ydl, Xdl, ...
-        pinn.physicsFcn, pinn.physParam, ...
-        param.lambda, param.epochs, param.lr );
+    % 设置损失项权重
+    pinn.lossWeights = param.lossWeights;
 
+    % 设置本阶段要训练的物理参数
+    pinn.trainablePhysParams = param.trainablePhysParams;
+
+    % 使用同一批数据作为物理点（后面你要改物理点采样再换这里）
+    X_phys = Xdl;
+
+    % 目前先让 lrNet = lrPhys = param.lr，后面你想拆再拆
+    pinn.train( ...
+        Xdl, ...                % X_data
+        Ydl, ...                % Y_data
+        X_phys, ...             % X_phys
+        pinn.physicsFcn, ...    % 正向迟滞模型
+        pinn.lossWeights, ...   % 损失权重
+        param.epochs, ...       % 轮数
+        param.lr, ...           % lrNet
+        param.lr );             % lrPhys
+
+    endIdx = numel(pinn.lossHistory.iter);
+    titleName = char(sprintf("%s | Group %s", param.name, group.name));
+    plot_stage_summary(pinn, group, param, normIn, normOut, ...
+                       titleName, startIdx:endIdx);
 end
 
-%% ================== 辅助绘图函数 ==================
-% 以下函数你可以随意修改和增删
-function plot_stage_fit(pinn, stageId, t_train, u_train, v_train, ...
-                        t_test,  u_test,  v_test, ...
-                        normIn, normOut)
-    % 1) 物理 u -> 归一化 u_norm
+function plot_stage_summary(pinn, group, param, normIn, normOut, titleName, idxRange)
+%PLOT_STAGE_SUMMARY
+% 在一个 figure 中绘制：
+%   (1) Loss 曲线（可选 idxRange）
+%   (2) v(t) Train/Test 拟合 + MSE
+%   (3) 滞回曲线 u-v
+%
+% group: struct，包含 t, u_raw, v_raw, u_norm, v_norm
+% param: 本阶段训练参数结构体（name, train_ratio, epochs, lr, trainablePhysParams, lossWeights）
+% normIn / normOut: 归一化信息
+% titleName: 字符串，用于 figure 名称
+% idxRange: 可选，本阶段 lossHistory 的索引范围（startIdx:endIdx）
+
+    % ===== 打印训练参数 =====
+    fprintf('Plot summary for %s: ', param.name);
+    fprintf('train_ratio=%.2f, epochs=%d, lr=%.2g\n', ...
+        param.train_ratio, param.epochs, param.lr);
+    if isfield(param,'lossWeights')
+        lw = param.lossWeights;
+        fprintf('  lossWeights: data=%.2g, phys=%.2g, mono=%.2g, smooth=%.2g\n', ...
+            lw.lambdaData, lw.lambdaPhys, lw.lambdaMono, lw.lambdaSmooth);
+    end
+    if isfield(param,'trainablePhysParams') && ~isempty(param.trainablePhysParams)
+        names = strjoin(param.trainablePhysParams, ', ');
+        fprintf('  trainablePhysParams: {%s}\n', names);
+    else
+        fprintf('  trainablePhysParams: {}\n');
+    end
+
+    % ===== 基本数据拆分 =====
+    t = group.t(:);
+    u = group.u_raw(:);
+    v = group.v_raw(:);
+    N = numel(u);
+    Ntr = floor(param.train_ratio * N);
+
+    t_train = t(1:Ntr);
+    t_test  = t(Ntr+1:end);
+    u_train = u(1:Ntr);
+    v_train = v(1:Ntr);
+    u_test  = u(Ntr+1:end);
+    v_test  = v(Ntr+1:end);
+
+    % ===== 0. 建立 figure =====
+    if nargin < 6 || isempty(titleName)
+        titleName = param.name;
+    end
+    h = figure('Name',[char(titleName) ' Summary']);
+
+    warning('off','MATLAB:HandleGraphics:ObsoletedProperty:JavaFrame');    % 关闭相关的警告提示（因为调用了非公开接口）
+    jFrame = get(h,'JavaFrame');    % 获取底层 Java 结构相关句柄吧
+    set(jFrame,'Maximized',1);    %设置其最大化为真（0 为假）
+    pause(0.1);    % 实践中设定最大化之后需要停顿一下，否则后续获取窗口尺寸可能还是默认大小
+    % warning('on','MATLAB:HandleGraphics:ObsoletedProperty:JavaFrame');    % 打开相关警告设置
+
+    %% ================== 1) Loss 曲线 ==================
+    subplot(3,1,1); hold on; box on;
+
+    if ~isempty(pinn.lossHistory.components)
+        if nargin < 7 || isempty(idxRange)
+            idxRange = 1:numel(pinn.lossHistory.iter);
+        end
+
+        it   = pinn.lossHistory.iter(idxRange);
+        Lall = pinn.lossHistory.components(:, idxRange);
+
+        Ltotal = Lall(1,:);
+        Ldata  = Lall(2,:);
+        Lphys  = Lall(3,:);
+        Lmono  = Lall(4,:);
+        Lsmooth= Lall(5,:);
+
+        plot(it, Ltotal, 'k','LineWidth',1.2);
+        plot(it, Ldata,  'b--','LineWidth',1.0);
+        plot(it, Lphys,  'r--','LineWidth',1.0);
+        plot(it, Lmono,  'g--','LineWidth',1.0);
+        plot(it, Lsmooth,'m--','LineWidth',1.0);
+        xlabel('Iteration'); ylabel('Loss');
+        legend('Total','Data','Phys','Mono','Smooth','Location','best');
+        title('Loss History');
+        grid on;
+    else
+        title('Loss History (empty)');
+        axis off;
+    end
+
+    %% ================== 2) v(t) 拟合 ==================
+    % 2.1 归一化 u
     [u_train_norm_row, ~] = BasePINN.normalizeData(u_train.', normIn.mode, normIn);
     [u_test_norm_row,  ~] = BasePINN.normalizeData(u_test.',  normIn.mode, normIn);
 
-    % 2) 前向预测（归一化空间）
+    % 2.2 前向预测（归一化空间）
     v_train_pred_norm_dl = pinn.forward(dlarray(single(u_train_norm_row)));
     v_test_pred_norm_dl  = pinn.forward(dlarray(single(u_test_norm_row)));
 
+    % 2.3 反归一化到物理域
     v_train_pred_norm_row = double(extractdata(v_train_pred_norm_dl));
     v_test_pred_norm_row  = double(extractdata(v_test_pred_norm_dl));
 
-    % 3) 反归一化回物理电压
     v_train_pred_row = BasePINN.denormalizeData(v_train_pred_norm_row, normOut);
     v_test_pred_row  = BasePINN.denormalizeData(v_test_pred_norm_row,  normOut);
 
-    v_train_pred = v_train_pred_row.';  % N_train x 1
-    v_test_pred  = v_test_pred_row.';   % N_test x 1
+    v_train_pred = v_train_pred_row.';   % N_train x 1
+    v_test_pred  = v_test_pred_row.';    % N_test  x 1
 
     mse_train = mean((v_train_pred - v_train).^2);
     mse_test  = mean((v_test_pred  - v_test).^2);
 
-    figure('Name',sprintf('Stage %d Fit', stageId));
-    subplot(2,1,1); hold on; box on;
-    plot(t_train, v_train, 'b','LineWidth',1.2);
-    plot(t_train, v_train_pred,'r--','LineWidth',1.2);
-    xlabel('t [s]'); ylabel('Voltage v [V]');
-    title(sprintf('Stage %d Train fit (MSE=%.2e)', stageId, mse_train));
-    legend('True v','PINN v_{pred}','Location','best');
+    subplot(3,1,2); hold on; box on;
+    plot(t_train, v_train,      'b','LineWidth',1.2);
+    plot(t_train, v_train_pred, 'r--','LineWidth',1.2);
+    plot(t_test,  v_test,       'c','LineWidth',1.0);
+    plot(t_test,  v_test_pred,  'm--','LineWidth',1.0);
+    xlabel('t'); ylabel('v');
+    title(sprintf('Fit vs Time (MSE_{train}=%.2e, MSE_{test}=%.2e)', mse_train, mse_test));
+    legend('v_{train}','v_{train,pred}','v_{test}','v_{test,pred}','Location','best');
+    grid on;
 
-    subplot(2,1,2); hold on; box on;
-    plot(t_test, v_test, 'b','LineWidth',1.2);
-    plot(t_test, v_test_pred,'r--','LineWidth',1.2);
-    xlabel('t [s]'); ylabel('Voltage v [V]');
-    title(sprintf('Stage %d Test fit (MSE=%.2e)', stageId, mse_test));
-    legend('True v','PINN v_{pred}','Location','best');
-end
+    %% ================== 3) 滞回曲线 u-v ==================
+    % 用全序列 u_raw -> v_true / v_pred
+    [u_norm_all_row, ~] = BasePINN.normalizeData(u.', normIn.mode, normIn);
+    v_pred_all_norm_dl  = pinn.forward(dlarray(single(u_norm_all_row)));
+    v_pred_all_norm_row = double(extractdata(v_pred_all_norm_dl));
+    v_pred_all_row      = BasePINN.denormalizeData(v_pred_all_norm_row, normOut);
+    v_pred_all          = v_pred_all_row.';   % N x 1
 
-function plot_stage_loss(pinn, stageId, idxRange)
-    if isempty(pinn.lossHistory.components)
-        return;
-    end
-    it   = pinn.lossHistory.iter(idxRange);
-    Lall = pinn.lossHistory.components(:, idxRange);
-    Ltotal = Lall(1,:);
-    Ldata  = Lall(2,:);
-    Lphys  = Lall(3,:);
-    Lmono  = Lall(4,:);
-    Lsmooth= Lall(5,:);
-
-    figure('Name',sprintf('Stage %d Loss', stageId));
-    hold on; box on;
-    plot(it, Ltotal, 'k','LineWidth',1.2);
-    plot(it, Ldata,  'b--','LineWidth',1.0);
-    plot(it, Lphys,  'r--','LineWidth',1.0);
-    plot(it, Lmono,  'g--','LineWidth',1.0);
-    plot(it, Lsmooth,'m--','LineWidth',1.0);
-    xlabel('Iteration'); ylabel('Loss');
-    legend('Total','Data','Phys','Mono','Smooth','Location','best');
-    title(sprintf('Stage %d Loss History', stageId));
+    subplot(3,1,3); hold on; box on;
+    plot(u, v,         'b.', 'DisplayName','True');
+    plot(u, v_pred_all,'r.', 'DisplayName','Pred');
+    xlabel('u'); ylabel('v');
+    title('Hysteresis (u-v)');
+    legend('Location','best');
     grid on;
 end

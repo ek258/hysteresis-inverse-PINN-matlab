@@ -175,6 +175,14 @@ classdef BasePINN < handle
             save(filename, 'obj');
         end
 
+        function clearLossHistory(obj)
+            obj.lossHistory = struct( ...
+                'iter',      [], ...   % 1 x K
+                'total',     [], ...   % 1 x K
+                'components', [] );    % n_terms x K
+            obj.iteration = 0;
+        end
+
         %% ================== 抽象损失接口 ==================
         % 子类必须实现：返回标量 loss 以及针对 paramsNet, paramsPhys 的梯度结构
         function [loss, gradsNet, gradsPhys] = computeLoss(obj, paramsNet, paramsPhys, ...

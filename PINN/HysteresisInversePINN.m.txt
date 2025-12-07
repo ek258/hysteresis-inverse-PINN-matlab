@@ -15,40 +15,75 @@ classdef HysteresisInversePINN < BasePINN
     % 归一化:
     %   - 网络内部全部在归一化空间上工作 (u_norm, v_norm)
     %   - 物理项: 先把 u_norm, v_norm 反归一化为物理量 u_phys, v_phys
-    %             再喂 physicsFcn(v_phys, physParam)
+    %             再喂 physicsFcn(v_phys, paramsPhys)
     % -----------------------------------------------------------
 
     properties
-        physParam       % 正向迟滞模型参数
-        lossWeights     % 结构体 {lambdaData, lambdaPhys, lambdaMono, lambdaSmooth}
-        physicsFcn      % 正向迟滞算子 (function handle)
+        % 记录一份初始物理参数（原 physParam），只作为备查/重置用
+        physParamInit      % struct，字段由外部决定，例如 {eta,r,P,...}
 
-        normIn          % 输入归一化参数 struct，字段至少包含 .mode
-        normOut         % 输出归一化参数 struct，字段至少包含 .mode
+        lossWeights        % struct {lambdaData, lambdaPhys, lambdaMono, lambdaSmooth}
+        physicsFcn         % 正向迟滞算子 (function handle)
+
+        normIn             % 输入归一化参数 struct，字段至少包含 .mode
+        normOut            % 输出归一化参数 struct，字段至少包含 .mode
     end
 
     methods
         %% ---------- 构造 ----------
-        function obj = HysteresisInversePINN(layers, physParam, lossWeights, physicsFcn)
+        function obj = HysteresisInversePINN(layers, physParamInit, lossWeights, physicsFcn)
+            % layers        : MLP 结构
+            % physParamInit : 物理参数初值（numeric struct）
+            %                 其中需要参与训练的字段，会被转成 dlarray(single)
+            % lossWeights   : 各项损失权重
+            % physicsFcn    : 物理前向算子句柄，例如
+            %                 @(v,theta) GPI_forward_dl(v, theta_full, [])
+
             obj@BasePINN(layers);
-            obj.physParam   = physParam;
-            obj.lossWeights = lossWeights;
-            obj.physicsFcn  = physicsFcn;
 
-            % initParams 物理参数加入学习目标
-            obj.params.eta = dlarray(single(physParam.eta(:)'));   % 确保维度匹配 GPI_forward_dl (1 x nD)
-            obj.params.r   = dlarray(single(physParam.r(:)));      % 维度 nR x 1
-            obj.params.P   = dlarray(single(physParam.P(:)'));     % 1 x nR
-            % obj.params.rd  = dlarray(single(physParam.rd(:)'));    % 1 x nD（若 rd 可学习）
+            % ------- 物理参数初始化到 BasePINN.paramsPhys -------
+            if nargin >= 2 && ~isempty(physParamInit)
+                obj.physParamInit = physParamInit;
 
-            % initAdamState 初始化这些参数的一阶/二阶矩估计为零
-            obj.adamAvg.eta = dlarray(zeros(size(obj.params.eta), 'like', obj.params.eta));
-            obj.adamAvgSq.eta = dlarray(zeros(size(obj.params.eta), 'like', obj.params.eta));
-            obj.adamAvg.r = dlarray(zeros(size(obj.params.r), 'like', obj.params.r));
-            obj.adamAvgSq.r = dlarray(zeros(size(obj.params.r), 'like', obj.params.r));
-            obj.adamAvg.P = dlarray(zeros(size(obj.params.P), 'like', obj.params.P));
-            obj.adamAvgSq.P = dlarray(zeros(size(obj.params.P), 'like', obj.params.P));
+                fn = fieldnames(physParamInit);
+                paramsPhys = struct();
+                for i = 1:numel(fn)
+                    name = fn{i};
+                    val  = physParamInit.(name);
 
+                    % 统一转成 dlarray(single) 以支持梯度
+                    if isa(val, 'dlarray')
+                        paramsPhys.(name) = val;
+                    else
+                        paramsPhys.(name) = dlarray(single(val));
+                    end
+                end
+                obj.paramsPhys = paramsPhys;
+
+                % 对物理参数初始化 Adam 状态
+                [obj.adamAvgPhys, obj.adamAvgSqPhys] = obj.initAdamState(obj.paramsPhys);
+
+                % 默认所有物理参数都可训练
+                obj.trainablePhysParams = fieldnames(obj.paramsPhys);
+            end
+
+            if nargin >= 3 && ~isempty(lossWeights)
+                obj.lossWeights = lossWeights;
+            else
+                obj.lossWeights = struct( ...
+                    'lambdaData',   1.0, ...
+                    'lambdaPhys',   0.0, ...
+                    'lambdaMono',   0.0, ...
+                    'lambdaSmooth', 0.0);
+            end
+
+            if nargin >= 4 && ~isempty(physicsFcn)
+                obj.physicsFcn = physicsFcn;
+            else
+                obj.physicsFcn = [];
+            end
+
+            % 默认不做归一化
             obj.normIn  = struct('mode','none');
             obj.normOut = struct('mode','none');
         end
@@ -68,27 +103,39 @@ classdef HysteresisInversePINN < BasePINN
         % v_phys: 同维度 (物理量)
         function v_phys = predictPhysical(obj, u_phys)
             u_row = u_phys(:)';   % 1 x N
+
             % 归一化输入
             u_norm = obj.applyNormIn(u_row);
+
             % 网络前向
             u_norm_dl = dlarray(single(u_norm));
             v_norm_dl = obj.forward(u_norm_dl);
             v_norm    = double(extractdata(v_norm_dl));
+
             % 反归一化输出
             v_row = obj.applyDenormOut(v_norm);
             v_phys = v_row(:);
         end
 
         %% ---------- 核心损失 ----------
-        function [loss, grads] = computeLoss(obj, params, ...
-                                             X_data, Y_data, X_phys, ...
-                                             physicsFcn, physParam, lossWeights)
+        function [loss, gradsNet, gradsPhys] = computeLoss(obj, paramsNet, paramsPhys, ...
+                                                           X_data, Y_data, X_phys, ...
+                                                           physicsFcn, lossWeights)
             % X_data, Y_data, X_phys 均在归一化空间
             % X_*: 1 x N, dlarray(single)
             % Y_*: 1 x N, dlarray(single)
 
+            if nargin < 7 || isempty(physicsFcn)
+                physicsFcn = obj.physicsFcn;
+            end
+            if nargin < 8 || isempty(lossWeights)
+                lossWeights = obj.lossWeights;
+            end
+
             [L_data, L_phys, L_mono, L_smooth] = obj.computeLossTerms( ...
-                params, X_data, Y_data, X_phys, physicsFcn, physParam, lossWeights);
+                paramsNet, paramsPhys, ...
+                X_data, Y_data, X_phys, ...
+                physicsFcn, lossWeights);
 
             % -------------------------------
             % 总损失
@@ -100,16 +147,25 @@ classdef HysteresisInversePINN < BasePINN
                 lossWeights.lambdaSmooth * L_smooth;
 
             % -------------------------------
-            % 梯度
+            % 梯度：对网络参数 + 物理参数同时求导
             % -------------------------------
-            grads = dlgradient(loss, params);
+            [gradsNet, gradsPhys] = dlgradient(loss, paramsNet, paramsPhys);
         end
-        
-        function Lvec = evalLossComponents(obj, params, ...
+
+        function Lvec = evalLossComponents(obj, paramsNet, paramsPhys, ...
                                            X_data, Y_data, X_phys, ...
-                                           physicsFcn, physParam, lossWeights)
+                                           physicsFcn, lossWeights)
+            if nargin < 7 || isempty(physicsFcn)
+                physicsFcn = obj.physicsFcn;
+            end
+            if nargin < 8 || isempty(lossWeights)
+                lossWeights = obj.lossWeights;
+            end
+
             [L_data, L_phys, L_mono, L_smooth] = obj.computeLossTerms( ...
-                params, X_data, Y_data, X_phys, physicsFcn, physParam, lossWeights);
+                paramsNet, paramsPhys, ...
+                X_data, Y_data, X_phys, ...
+                physicsFcn, lossWeights);
 
             % ---------- 总损失 ----------
             L_total = ...
@@ -125,12 +181,12 @@ classdef HysteresisInversePINN < BasePINN
     end
 
     methods (Access = private)
-        function [L_data, L_phys, L_mono, L_smooth] = computeLossTerms(obj, params, ...
-                X_data, Y_data, X_phys, physicsFcn, physParam, lossWeights)
+        function [L_data, L_phys, L_mono, L_smooth] = computeLossTerms(obj, paramsNet, paramsPhys, ...
+                X_data, Y_data, X_phys, physicsFcn, lossWeights)
             % -------------------------------
             % 1) 数据前向：v_pred_data_norm = f(u_norm_data)
             % -------------------------------
-            v_pred_data_norm = BasePINN.forwardWithParams(params, X_data);
+            v_pred_data_norm = BasePINN.forwardWithParams(paramsNet, X_data);
 
             % -------------------------------
             % 2) 数据项 L_data (归一化空间)
@@ -145,22 +201,18 @@ classdef HysteresisInversePINN < BasePINN
             % 3) 物理一致性项 L_phys: H(v_phys_pred) ≈ u_phys
             %    先把 u_norm, v_norm 转回物理空间
             % -------------------------------
-            if lossWeights.lambdaPhys ~= 0
+            if lossWeights.lambdaPhys ~= 0 && ~isempty(physicsFcn)
                 % 3.1 归一化空间中预测
-                v_pred_phys_norm = BasePINN.forwardWithParams(params, X_phys);
+                v_pred_phys_norm = BasePINN.forwardWithParams(paramsNet, X_phys);
 
                 % 3.2 反归一化到物理空间
-                u_phys = obj.applyDenormIn(X_phys);           % u_phys
-                v_phys = obj.applyDenormOut(v_pred_phys_norm);% v_phys
+                u_phys = obj.applyDenormIn(X_phys);            % u_phys
+                v_phys = obj.applyDenormOut(v_pred_phys_norm); % v_phys
+
                 % 3.3 调用正向迟滞模型得到 u_hat
-                theta = physParam;
-                theta.eta = params.eta; 
-                theta.r   = params.r;
-                theta.P   = params.P;
-                if isfield(params, 'rd')
-                    theta.rd = params.rd;
-                end
-                u_hat = physicsFcn(v_phys, theta);        % 物理量
+                %     这里假设 physicsFcn 的签名为：
+                %       u_hat = physicsFcn(v_phys, paramsPhys)
+                u_hat = physicsFcn(v_phys, paramsPhys);
 
                 % 3.4 在物理空间上计算残差
                 L_phys = mean((u_hat - u_phys).^2, "all");
@@ -194,7 +246,7 @@ classdef HysteresisInversePINN < BasePINN
                 L_smooth = dlarray(single(0));
             end
         end
-    
+
     end
 
     %% ========== 工具：dlarray 友好的归一化/反归一化 ==========
@@ -253,33 +305,9 @@ classdef HysteresisInversePINN < BasePINN
             end
         end
 
-        % 对输出 v 做归一化 / 反归一化
-        function v_n = applyNormOut(obj, v)
-            mode = 'none';
-            if isfield(obj.normOut, 'mode')
-                mode = lower(obj.normOut.mode);
-            end
-
-            switch mode
-                case 'zscore'
-                    mu    = obj.normOut.mu;
-                    sigma = obj.normOut.sigma;
-                    if sigma == 0, sigma = 1; end
-                    v_n = (v - mu) ./ sigma;
-
-                case 'minmax'
-                    xmin = obj.normOut.xmin;
-                    xmax = obj.normOut.xmax;
-                    denom = xmax - xmin;
-                    if denom == 0, denom = 1; end
-                    v_n = (v - xmin) ./ denom;
-
-                otherwise
-                    v_n = v;
-            end
-        end
-
+        % 对输出 v 的归一化值做反归一化 (物理项中恢复 v_phys)
         function v = applyDenormOut(obj, v_n)
+            % v_n: 1 x N (dlarray 或 double)
             mode = 'none';
             if isfield(obj.normOut, 'mode')
                 mode = lower(obj.normOut.mode);
